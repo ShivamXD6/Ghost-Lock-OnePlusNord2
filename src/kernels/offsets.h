@@ -62,7 +62,7 @@ struct kernel_offsets {
   .task_pid = 0x5b8, .task_tgid = 0x5bc,                                       \
   .task_atomic_flags = 0x580, .task_real_cred = 0x760, .task_cred = 0x768,     \
   .task_comm = 0x770, .task_tasks = 0x4b8, .task_seccomp = 0x810,              \
-  .compact_waiter = 2, .mm_struct_sz = 0x3c0
+  .compact_waiter = 2, .mm_struct_sz = 0x388
 
 static const struct kernel_offsets known_offsets[] = {
 /* Add new kernels by creating src/kernels/<uname-release>/offsets.h */
