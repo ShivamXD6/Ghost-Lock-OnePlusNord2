@@ -233,8 +233,11 @@ static void fill_external_entry(struct kernel_offsets *out,
   if (v && json_parse_int(v, end, &num)) {
     out->compact_waiter = (uint8_t)num;
   }
+  /* JSON key "mm_struct_sz" kept for compatibility. The value MUST be the SLUB
+   * object stride (s->size) of the mm_struct cache, never sizeof(struct mm_struct).
+   * A zero value falls back to the MM_STRUCT_SZ default via mm_struct_stride(). */
   v = json_member_value(obj, end, "mm_struct_sz");
-  if (v && json_parse_int(v, end, &num)) {
+  if (v && json_parse_int(v, end, &num) && num > 0) {
     out->mm_struct_sz = (uint32_t)num;
   }
   v = json_member_value(obj, end, "symbols");

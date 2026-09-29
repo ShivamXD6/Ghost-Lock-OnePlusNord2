@@ -22,9 +22,12 @@ struct kernel_offsets {
 
   /* rt_mutex_waiter layout: 0 = 6.6 rb_node, 1 = 6.1 compact tree_entry */
   uint8_t compact_waiter;
-  /* mm_struct SLUB stride; 0 uses target.h default (6.6 GKI 0x500).
-   * android14-6.1 uses 0x400 (BTF reports 0x3c0). */
-  uint32_t mm_struct_sz;
+  /* mm_struct SLUB object stride (s->size); 0 uses target.h default (6.6 GKI 0x500).
+   * android14-6.1 uses 0x400 (BTF reports 0x3c0).
+   * CONTRACT: this is the allocator stride
+   *   s->size = ALIGN(sizeof(struct mm_struct) + cpumask_size(), cache_line_size()),
+   * never sizeof(struct mm_struct). */
+  uint32_t mm_struct_sz; /* storage/JSON key kept for compatibility */
   uint32_t _pad[3];
 };
 
@@ -62,7 +65,11 @@ struct kernel_offsets {
   .task_pid = 0x5b8, .task_tgid = 0x5bc,                                       \
   .task_atomic_flags = 0x580, .task_real_cred = 0x760, .task_cred = 0x768,     \
   .task_comm = 0x770, .task_tasks = 0x4b8, .task_seccomp = 0x810,              \
-  .compact_waiter = 2, .mm_struct_sz = 0x388
+  .compact_waiter = 2, .mm_struct_sz = 0x3c0
+/* F.59 4.19.191+ mm_struct stride derivation: sizeof(struct mm_struct) = 0x388,
+ * + cpumask (NR_CPUS=8) = 0x390; cache_line_size() = 64 (CTR_EL0 CWG=4 on
+ * Cortex-A78/A55), so stride = ALIGN(0x390, 64) = 0x3c0;
+ * 32768 / 0x3c0 = 34 objects per slab. */
 
 static const struct kernel_offsets known_offsets[] = {
 /* Add new kernels by creating src/kernels/<uname-release>/offsets.h */

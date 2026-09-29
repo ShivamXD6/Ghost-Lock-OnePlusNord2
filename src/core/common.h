@@ -44,11 +44,15 @@
 #define SKB_DATA_DELTA (-0xe80LL)
 #define MM_STRUCT_SZ 0x500
 
-/* mm_struct stride; 0 uses MM_STRUCT_SZ above. */
-#define mm_struct_sz()                                                        \
+/* SLUB object stride (s->size) of the mm_struct cache; 0 uses MM_STRUCT_SZ.
+ * This is the allocator stride, NOT sizeof(struct mm_struct). */
+#define mm_struct_stride()                                                    \
   (active_offsets && active_offsets->mm_struct_sz                             \
        ? active_offsets->mm_struct_sz                                         \
        : MM_STRUCT_SZ)
+
+/* Deprecated alias kept for compatibility; do not use in new code. */
+#define mm_struct_sz() mm_struct_stride()
 
 #define MM_ORDER 3
 #define MM_PARTIALS 5
@@ -59,6 +63,10 @@ extern int g_core_consumer;
 #define KSNITCH_COLLISIONS 4
 
 #define ORDER3_SIZE (PAGE_SIZE << MM_ORDER)
+/* mm_struct slab size in bytes. Must equal PAGE_SIZE << mm_slab_order as
+ * computed in kernelsnitch.h when mm_slab_order == MM_ORDER. */
+#define MM_SLAB_SZ ((size_t)PAGE_SIZE << MM_ORDER)
+_Static_assert(ORDER3_SIZE == MM_SLAB_SZ, "ORDER3_SIZE must equal MM_SLAB_SZ");
 #define SKB_SEND_SIZE (ORDER3_SIZE * 2)
 #define SKB_RECLAIM_SENDS 4
 #define FOPS_TABLE_OFF FOPS_OFF

